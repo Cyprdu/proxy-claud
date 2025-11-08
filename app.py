@@ -1,9 +1,9 @@
 from flask import Flask, request, Response, stream_with_context
 import requests
 from urllib.parse import urljoin, urlparse
+import asyncio
+from playwright.async_api import async_playwright
 import re
-from bs4 import BeautifulSoup
-import time
 
 app = Flask(__name__)
 
@@ -14,104 +14,151 @@ HEADERS = {
     'Referer': 'https://www.google.com/',
 }
 
-def find_video_from_page(page_url, timeout=15):
+# Cache pour éviter de re-scanner les mêmes pages
+video_cache = {}
+
+async def extract_video_with_browser(page_url, timeout=30):
     """
-    Charge la page et trouve automatiquement le flux vidéo principal
-    Retourne l'URL du flux vidéo trouvé
+    Utilise un navigateur headless pour charger la page et capturer
+    les requêtes réseau pour trouver le flux m3u8/mp4
     """
-    try:
-        # Récupère la page HTML
-        response = requests.get(page_url, headers=HEADERS, timeout=timeout)
-        html_content = response.text
+    captured_videos = []
+    
+    async with async_playwright() as p:
+        # Lance Chrome en mode headless
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
         
-        # Liste de priorité pour les formats
-        video_urls = {
-            'm3u8': [],
-            'mp4': [],
-            'mpd': []
-        }
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
         
-        # Patterns pour trouver les URLs
-        patterns = {
-            'm3u8': r'https?://[^\s\'"<>]+\.m3u8[^\s\'"<>]*',
-            'mp4': r'https?://[^\s\'"<>]+\.mp4[^\s\'"<>]*',
-            'mpd': r'https?://[^\s\'"<>]+\.mpd[^\s\'"<>]*',
-        }
+        page = await context.new_page()
         
-        # Cherche dans le HTML brut
-        for format_type, pattern in patterns.items():
-            matches = re.findall(pattern, html_content)
-            video_urls[format_type].extend(matches)
-        
-        # Parse avec BeautifulSoup
-        soup = BeautifulSoup(html_content, 'html.parser')
-        
-        # Cherche dans toutes les balises possibles
-        for tag in soup.find_all(['video', 'source', 'iframe', 'script']):
-            # Attributs à vérifier
-            attrs_to_check = ['src', 'data-src', 'data-url', 'data-video', 'data-stream']
+        # Intercepte toutes les requêtes réseau
+        async def handle_route(route, request):
+            url = request.url
             
-            for attr in attrs_to_check:
-                src = tag.get(attr)
-                if src:
-                    full_url = urljoin(page_url, src)
-                    if '.m3u8' in full_url:
-                        video_urls['m3u8'].append(full_url)
-                    elif '.mp4' in full_url:
-                        video_urls['mp4'].append(full_url)
-                    elif '.mpd' in full_url:
-                        video_urls['mpd'].append(full_url)
+            # Cherche les fichiers vidéo dans les requêtes
+            if any(ext in url for ext in ['.m3u8', '.mp4', '.mpd', '.ts']):
+                print(f"🎥 Vidéo détectée: {url}")
+                if '.m3u8' in url:
+                    captured_videos.append(('m3u8', url))
+                elif '.mp4' in url:
+                    captured_videos.append(('mp4', url))
+                elif '.mpd' in url:
+                    captured_videos.append(('mpd', url))
+            
+            # Continue la requête normalement
+            await route.continue_()
         
-        # Cherche dans les scripts JavaScript
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string:
-                # Cherche des patterns communs de déclaration de source vidéo
-                for format_type, pattern in patterns.items():
-                    matches = re.findall(pattern, script.string)
-                    video_urls[format_type].extend(matches)
+        # Active l'interception des requêtes
+        await page.route('**/*', handle_route)
         
-        # Nettoie et déduplique
-        for format_type in video_urls:
-            video_urls[format_type] = list(set(video_urls[format_type]))
+        try:
+            # Charge la page
+            print(f"🌐 Chargement de la page: {page_url}")
+            await page.goto(page_url, wait_until='networkidle', timeout=timeout * 1000)
+            
+            # Attend un peu pour que les vidéos se chargent
+            await page.wait_for_timeout(5000)
+            
+            # Essaye de cliquer sur le bouton play si présent
+            try:
+                play_button = await page.query_selector('button[aria-label*="play"], button.play, .play-button, button[title*="Play"]')
+                if play_button:
+                    print("▶️ Clic sur le bouton play")
+                    await play_button.click()
+                    await page.wait_for_timeout(3000)
+            except:
+                pass
+            
+            # Essaye de cliquer sur la vidéo elle-même
+            try:
+                video = await page.query_selector('video')
+                if video:
+                    print("🎬 Clic sur la vidéo")
+                    await video.click()
+                    await page.wait_for_timeout(3000)
+            except:
+                pass
+            
+        except Exception as e:
+            print(f"⚠️ Erreur lors du chargement: {e}")
         
-        # Retourne le premier trouvé selon la priorité : m3u8 > mp4 > mpd
-        if video_urls['m3u8']:
-            return video_urls['m3u8'][0], 'm3u8'
-        elif video_urls['mp4']:
-            return video_urls['mp4'][0], 'mp4'
-        elif video_urls['mpd']:
-            return video_urls['mpd'][0], 'mpd'
+        finally:
+            await browser.close()
+    
+    # Priorise m3u8 > mp4 > mpd
+    for video_type, url in captured_videos:
+        if video_type == 'm3u8':
+            return url, 'm3u8'
+    
+    for video_type, url in captured_videos:
+        if video_type == 'mp4':
+            return url, 'mp4'
+    
+    for video_type, url in captured_videos:
+        if video_type == 'mpd':
+            return url, 'mpd'
+    
+    return None, None
+
+def extract_video_sync(page_url):
+    """Version synchrone pour Flask"""
+    # Vérifie le cache
+    if page_url in video_cache:
+        print(f"📦 Utilisation du cache pour: {page_url}")
+        return video_cache[page_url]
+    
+    # Crée un nouvel event loop pour l'async
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        video_url, video_type = loop.run_until_complete(
+            extract_video_with_browser(page_url)
+        )
         
-        return None, None
+        # Met en cache
+        if video_url:
+            video_cache[page_url] = (video_url, video_type)
         
-    except Exception as e:
-        print(f"Erreur lors de l'extraction: {e}")
-        return None, None
+        return video_url, video_type
+    finally:
+        loop.close()
 
 @app.route('/')
 def home():
     return '''
     <html>
     <head>
-        <title>Video Proxy Server</title>
+        <title>Video Proxy Server - Browser Edition</title>
         <style>
             body { font-family: Arial; max-width: 800px; margin: 50px auto; padding: 20px; }
             h1 { color: #333; }
             .endpoint { background: #f4f4f4; padding: 15px; border-radius: 5px; margin: 20px 0; }
             code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; }
             .example { color: #0066cc; }
+            .warning { background: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin: 15px 0; }
         </style>
     </head>
     <body>
-        <h1>🎥 Video Proxy Server</h1>
-        <p>Ce serveur extrait et proxifie automatiquement les flux vidéo.</p>
+        <h1>🎥 Video Proxy Server (Browser Edition)</h1>
+        <p>Ce serveur utilise un navigateur headless pour capturer les flux vidéo dynamiques.</p>
+        
+        <div class="warning">
+            ⚠️ <strong>Note:</strong> L'extraction avec navigateur prend 5-10 secondes. Soyez patient !
+        </div>
         
         <div class="endpoint">
             <h3>📋 Endpoints:</h3>
-            <p><strong>1. Auto-extraction et stream (recommandé):</strong><br>
+            <p><strong>1. Auto-extraction intelligente (avec navigateur):</strong><br>
             <code>GET /extract?url=URL_DE_LA_PAGE</code><br>
-            <small>Trouve automatiquement la vidéo et la stream</small></p>
+            <small>Simule une vraie visite, exécute le JS, capture le réseau</small></p>
             
             <p><strong>2. Stream HLS direct:</strong><br>
             <code>GET /hls?url=URL_M3U8</code></p>
@@ -121,15 +168,17 @@ def home():
         </div>
         
         <div class="endpoint">
-            <h3>💡 Exemple d'utilisation dans un player:</h3>
+            <h3>💡 Utilisation:</h3>
             <p class="example">
             &lt;video controls&gt;<br>
-            &nbsp;&nbsp;&lt;source src="https://votre-proxy.onrender.com/extract?url=https://site.com/video-page"&gt;<br>
+            &nbsp;&nbsp;&lt;source src="/extract?url=https://site.com/video-page"&gt;<br>
             &lt;/video&gt;
             </p>
         </div>
         
-        <p><small>Status: ✅ Serveur actif</small></p>
+        <p><a href="/test" style="background: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">🧪 Page de test</a></p>
+        
+        <p><small>Status: ✅ Serveur actif | Engine: Playwright Chromium</small></p>
     </body>
     </html>
     '''
@@ -137,8 +186,7 @@ def home():
 @app.route('/extract')
 def extract_and_stream():
     """
-    Extrait automatiquement la vidéo depuis une page et la stream directement
-    Utilisable directement dans un <video> tag
+    Extrait la vidéo avec un navigateur headless et la stream
     """
     page_url = request.args.get('url')
     
@@ -146,44 +194,54 @@ def extract_and_stream():
         return {'error': 'URL parameter required'}, 400
     
     try:
-        # Trouve le flux vidéo
-        video_url, video_type = find_video_from_page(page_url)
+        print(f"🔍 Extraction demandée pour: {page_url}")
+        
+        # Extrait la vidéo avec le navigateur
+        video_url, video_type = extract_video_sync(page_url)
         
         if not video_url:
-            return {'error': 'No video found on this page'}, 404
+            return {
+                'error': 'No video found', 
+                'message': 'Le navigateur n\'a détecté aucun flux vidéo sur cette page'
+            }, 404
         
-        print(f"Vidéo trouvée: {video_url} (type: {video_type})")
+        print(f"✅ Vidéo trouvée: {video_url} (type: {video_type})")
         
-        # Redirige vers le bon handler selon le type
+        # Stream selon le type
         if video_type == 'm3u8':
             return stream_hls_content(video_url)
         elif video_type == 'mp4':
             return stream_mp4_content(video_url)
+        elif video_type == 'mpd':
+            return stream_mpd_content(video_url)
         else:
             return {'error': f'Unsupported video type: {video_type}'}, 400
             
     except Exception as e:
+        print(f"❌ Erreur: {e}")
         return {'error': str(e)}, 500
 
 def stream_hls_content(url):
-    """Stream HLS content avec modification des URLs"""
+    """Stream HLS avec modification des URLs relatives"""
     try:
         response = requests.get(url, headers=HEADERS, timeout=10)
         
-        # Si c'est un manifeste m3u8
         if '.m3u8' in url or 'mpegurl' in response.headers.get('Content-Type', ''):
             content = response.text
             base_url = url.rsplit('/', 1)[0] + '/'
             
-            # Modifie les URLs dans le manifeste
+            # Modifie les URLs relatives dans le manifeste
             lines = []
             for line in content.split('\n'):
-                if line and not line.startswith('#'):
+                if line.strip() and not line.startswith('#'):
                     if not line.startswith('http'):
-                        # URL relative, on la rend absolue
-                        line = urljoin(base_url, line)
-                    # Proxifie via /segment
-                    proxy_url = request.host_url.rstrip('/') + '/segment?url=' + line
+                        # URL relative -> absolue
+                        absolute_url = urljoin(base_url, line.strip())
+                    else:
+                        absolute_url = line.strip()
+                    
+                    # Proxifie les segments
+                    proxy_url = request.host_url.rstrip('/') + '/segment?url=' + absolute_url
                     lines.append(proxy_url)
                 else:
                     lines.append(line)
@@ -196,7 +254,7 @@ def stream_hls_content(url):
             resp.headers['Access-Control-Allow-Headers'] = '*'
             return resp
         
-        # Sinon stream direct
+        # Stream binaire direct
         return Response(
             stream_with_context(response.iter_content(chunk_size=8192)),
             content_type=response.headers.get('Content-Type', 'application/octet-stream'),
@@ -207,7 +265,7 @@ def stream_hls_content(url):
         return {'error': str(e)}, 500
 
 def stream_mp4_content(url):
-    """Stream MP4 avec support du range"""
+    """Stream MP4 avec support du seeking"""
     try:
         range_header = request.headers.get('Range')
         headers = HEADERS.copy()
@@ -225,7 +283,6 @@ def stream_mp4_content(url):
         resp.headers['Content-Type'] = response.headers.get('Content-Type', 'video/mp4')
         resp.headers['Access-Control-Allow-Origin'] = '*'
         
-        # Headers pour le seeking
         for header in ['Content-Length', 'Content-Range', 'Accept-Ranges']:
             if header in response.headers:
                 resp.headers[header] = response.headers[header]
@@ -235,9 +292,20 @@ def stream_mp4_content(url):
     except Exception as e:
         return {'error': str(e)}, 500
 
+def stream_mpd_content(url):
+    """Stream DASH/MPD"""
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=10)
+        return Response(
+            response.content,
+            content_type='application/dash+xml',
+            headers={'Access-Control-Allow-Origin': '*'}
+        )
+    except Exception as e:
+        return {'error': str(e)}, 500
+
 @app.route('/hls')
 def stream_hls():
-    """Stream HLS direct (si vous avez déjà l'URL m3u8)"""
     url = request.args.get('url')
     if not url:
         return {'error': 'URL parameter required'}, 400
@@ -245,7 +313,6 @@ def stream_hls():
 
 @app.route('/mp4')
 def stream_mp4():
-    """Stream MP4 direct (si vous avez déjà l'URL mp4)"""
     url = request.args.get('url')
     if not url:
         return {'error': 'URL parameter required'}, 400
@@ -253,7 +320,7 @@ def stream_mp4():
 
 @app.route('/segment')
 def stream_segment():
-    """Proxifie les segments vidéo (utilisé par HLS)"""
+    """Proxifie les segments vidéo (TS, etc.)"""
     url = request.args.get('url')
     
     if not url:
@@ -273,7 +340,7 @@ def stream_segment():
 
 @app.route('/test')
 def test_page():
-    """Page de test avec un player intégré"""
+    """Page de test interactive"""
     test_url = request.args.get('url', '')
     
     return f'''
@@ -283,66 +350,87 @@ def test_page():
         <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <style>
             body {{ font-family: Arial; max-width: 900px; margin: 50px auto; padding: 20px; }}
-            video {{ width: 100%; max-width: 800px; }}
+            video {{ width: 100%; max-width: 800px; background: #000; }}
             input {{ width: 70%; padding: 10px; margin: 10px 0; }}
-            button {{ padding: 10px 20px; }}
+            button {{ padding: 10px 20px; background: #007bff; color: white; border: none; cursor: pointer; }}
+            button:hover {{ background: #0056b3; }}
+            #status {{ margin: 20px 0; padding: 10px; border-radius: 5px; }}
+            .loading {{ background: #fff3cd; color: #856404; }}
+            .success {{ background: #d4edda; color: #155724; }}
+            .error {{ background: #f8d7da; color: #721c24; }}
         </style>
     </head>
     <body>
         <h1>🎥 Test Video Proxy</h1>
         
-        <input type="text" id="urlInput" placeholder="URL de la page vidéo" value="{test_url}">
-        <button onclick="loadVideo()">Charger la vidéo</button>
+        <input type="text" id="urlInput" placeholder="URL de la page vidéo (ex: https://111movies.com/movie/...)" value="{test_url}">
+        <button onclick="loadVideo()">🚀 Extraire et lire</button>
         
-        <div id="status" style="margin: 20px 0; color: #666;"></div>
+        <div id="status"></div>
         
         <video id="videoPlayer" controls></video>
         
         <script>
+            function setStatus(message, type) {{
+                const status = document.getElementById('status');
+                status.textContent = message;
+                status.className = type;
+            }}
+            
             function loadVideo() {{
                 const url = document.getElementById('urlInput').value;
-                const status = document.getElementById('status');
                 const video = document.getElementById('videoPlayer');
                 
                 if (!url) {{
-                    status.textContent = '❌ Veuillez entrer une URL';
+                    setStatus('❌ Veuillez entrer une URL', 'error');
                     return;
                 }}
                 
-                status.textContent = '⏳ Chargement...';
+                setStatus('⏳ Chargement de la page avec le navigateur... (peut prendre 10-15 secondes)', 'loading');
                 
                 const proxyUrl = '/extract?url=' + encodeURIComponent(url);
                 
                 if (Hls.isSupported()) {{
-                    const hls = new Hls();
+                    const hls = new Hls({{
+                        debug: false,
+                        enableWorker: true,
+                        lowLatencyMode: true,
+                    }});
+                    
                     hls.loadSource(proxyUrl);
                     hls.attachMedia(video);
+                    
                     hls.on(Hls.Events.MANIFEST_PARSED, function() {{
-                        status.textContent = '✅ Vidéo chargée (HLS)';
+                        setStatus('✅ Vidéo chargée avec succès ! (HLS)', 'success');
                         video.play();
                     }});
+                    
                     hls.on(Hls.Events.ERROR, function(event, data) {{
                         if (data.fatal) {{
-                            status.textContent = '❌ Erreur: ' + data.type;
+                            setStatus('❌ Erreur: ' + data.type + ' - ' + data.details, 'error');
                         }}
                     }});
                 }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{
                     video.src = proxyUrl;
                     video.addEventListener('loadedmetadata', function() {{
-                        status.textContent = '✅ Vidéo chargée (native)';
+                        setStatus('✅ Vidéo chargée avec succès ! (Native HLS)', 'success');
                         video.play();
                     }});
+                    video.addEventListener('error', function() {{
+                        setStatus('❌ Erreur de chargement de la vidéo', 'error');
+                    }});
                 }} else {{
-                    // Essaye en MP4 direct
                     video.src = proxyUrl;
                     video.addEventListener('loadedmetadata', function() {{
-                        status.textContent = '✅ Vidéo chargée (MP4)';
+                        setStatus('✅ Vidéo chargée avec succès ! (MP4)', 'success');
                         video.play();
+                    }});
+                    video.addEventListener('error', function() {{
+                        setStatus('❌ Erreur de chargement de la vidéo', 'error');
                     }});
                 }}
             }}
             
-            // Charge automatiquement si URL présente
             if (document.getElementById('urlInput').value) {{
                 loadVideo();
             }}
@@ -350,6 +438,12 @@ def test_page():
     </body>
     </html>
     '''
+
+@app.route('/clear-cache')
+def clear_cache():
+    """Vide le cache des vidéos"""
+    video_cache.clear()
+    return {'success': True, 'message': 'Cache cleared'}
 
 if __name__ == '__main__':
     import os
