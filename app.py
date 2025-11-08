@@ -25,10 +25,16 @@ async def extract_video_with_browser(page_url, timeout=30):
     captured_videos = []
     
     async with async_playwright() as p:
-        # Lance Chrome en mode headless
+        # Lance Chrome en mode headless avec args pour Render
         browser = await p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox']
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-gpu'
+            ]
         )
         
         context = await browser.new_context(
