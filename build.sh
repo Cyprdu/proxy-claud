@@ -7,21 +7,25 @@ echo "📦 Installation des dépendances Python..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-echo "🌐 Installation de Chromium pour Playwright..."
-# Définit le chemin où Playwright doit installer les navigateurs
-export PLAYWRIGHT_BROWSERS_PATH=$HOME/.cache/ms-playwright
+echo "🌐 Configuration de Playwright..."
+# Utilise /opt/render/project/src au lieu de $HOME
+export PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/src/.cache/ms-playwright
 
-# Installe d'abord les dépendances système
+echo "📂 Chemin d'installation: $PLAYWRIGHT_BROWSERS_PATH"
+
+echo "📚 Installation des dépendances système..."
 python -m playwright install-deps chromium
 
-# Puis installe Chromium
+echo "⬇️ Téléchargement de Chromium..."
 python -m playwright install chromium
 
-# Vérifie que Chromium est bien installé
-if [ -f "$HOME/.cache/ms-playwright/chromium-*/chrome-linux/chrome" ]; then
+echo "🔍 Vérification de l'installation..."
+if ls $PLAYWRIGHT_BROWSERS_PATH/chromium-*/chrome-linux/chrome 1> /dev/null 2>&1; then
     echo "✅ Chromium installé avec succès !"
+    ls -la $PLAYWRIGHT_BROWSERS_PATH/
 else
-    echo "⚠️ Attention: Chromium pourrait ne pas être installé correctement"
+    echo "⚠️ Chromium non trouvé, listage du contenu:"
+    ls -la $PLAYWRIGHT_BROWSERS_PATH/ || echo "Dossier n'existe pas"
 fi
 
 echo "✅ Build terminé !"
