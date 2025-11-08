@@ -4,6 +4,11 @@ from urllib.parse import urljoin, urlparse
 import asyncio
 from playwright.async_api import async_playwright
 import re
+import os
+
+# Configure le chemin des navigateurs Playwright dès le démarrage
+os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH', 
+                      os.path.expanduser('~/.cache/ms-playwright'))
 
 app = Flask(__name__)
 
@@ -451,7 +456,32 @@ def clear_cache():
     video_cache.clear()
     return {'success': True, 'message': 'Cache cleared'}
 
+def check_playwright_installation():
+    """Vérifie que Playwright est correctement installé"""
+    import os
+    from pathlib import Path
+    
+    # Définit le chemin des navigateurs
+    playwright_path = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', 
+                                     os.path.expanduser('~/.cache/ms-playwright'))
+    
+    print(f"🔍 Vérification de Playwright...")
+    print(f"📂 Chemin des navigateurs: {playwright_path}")
+    
+    if Path(playwright_path).exists():
+        print(f"✅ Dossier Playwright trouvé")
+        # Liste les navigateurs installés
+        for item in Path(playwright_path).iterdir():
+            if item.is_dir():
+                print(f"   - {item.name}")
+    else:
+        print(f"⚠️ Dossier Playwright non trouvé")
+
 if __name__ == '__main__':
     import os
+    
+    # Vérifie l'installation de Playwright au démarrage
+    check_playwright_installation()
+    
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=True)
